@@ -68,7 +68,157 @@ Browser (React) ─► Express API ─► Anthropic Claude
 
 All third-party API keys live on the server. The browser never sees a vendor key. CORS is allowlisted to the production origin plus `localhost:5173`.
 
-## 4. Session Model
+## 4. Local-First Development Model
+
+Local containerized development is a first-class concern. The full stack — backend, frontend, Postgres, persistent audio volume — must run on the developer's laptop via a single command, with hot reload, before any cloud deploy happens. Production on Fly is a deployment target, not a development environment.
+
+### 4.1 docker-compose.yml — the local stack
+
+Four services at the repo root:
+
+```yaml
+# docker-compose.yml (Phase 1 sketch — concrete file written during implementation)
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: coach
+      POSTGRES_USER: coach
+      POSTGRES_PASSWORD: coach
+    ports: ["5432:5432"]
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coach"]
+      interval: 5s
+
+  mock-llm:
+    build: ./apps/mock-llm
+    ports: ["3100:3100"]
+    profiles: ["mock"]   # only starts when --profile mock is passed
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.dev
+    environment:
+      DATABASE_URL: postgres://coach:coach@postgres:5432/coach
+      AUDIO_TTL_DAYS: 7
+      AUDIO_MAX_BYTES: 5368709120
+      # ANTHROPIC_API_KEY / OPENAI_API_KEY come from .env, OR MOCK_LLM=1
+    env_file: [.env]
+    volumes:
+      - ./apps/api/src:/app/apps/api/src
+      - ./packages/shared:/app/packages/shared
+      - audio-data:/data/audio
+    ports: ["3000:3000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile.dev
+    volumes:
+      - ./apps/web/src:/app/apps/web/src
+      - ./packages/shared:/app/packages/shared
+    ports: ["5173:5173"]
+    depends_on: [api]
+
+volumes:
+  pg-data:
+  audio-data:
+```
+
+### 4.2 Dockerfiles
+
+Each app has two Dockerfiles:
+
+- `apps/api/Dockerfile.dev` — Node 20 base, installs all deps (including dev), runs `tsx watch src/index.ts`. No source baked in; mounted at runtime for hot reload.
+- `apps/api/Dockerfile` (prod) — multi-stage build: builder stage compiles TS, runtime stage is `node:20-alpine` with only `dist/` and prod deps. Used by Fly.
+- `apps/web/Dockerfile.dev` — runs `vite dev --host 0.0.0.0`. HMR over the host-mapped port.
+- `apps/web/Dockerfile` (prod) — runs `vite build`; the resulting `dist/` is **not** served by this image — instead it's copied into the api image's prod build, so production is a single container serving both API and static assets.
+
+### 4.3 Mock LLM service
+
+`apps/mock-llm/` is a small Express service that mimics Anthropic, OpenAI Whisper, and OpenAI TTS endpoints. Returns canned responses keyed by request fingerprint. Same fakes used by integration tests, so dev and test stay consistent.
+
+When `MOCK_LLM=1` is set on the `api` service, the LLM/STT/TTS client wrappers (Section 11) route to `http://mock-llm:3100` instead of the real vendor endpoints. **Zero API spend during day-to-day UI work.**
+
+Started via: `docker compose --profile mock up`. Default `docker compose up` does **not** start it — that requires real keys.
+
+### 4.4 Developer workflows
+
+**First-time setup:**
+
+```bash
+cp .env.example .env
+# Option A: edit .env with real ANTHROPIC_API_KEY and OPENAI_API_KEY
+# Option B: set MOCK_LLM=1 in .env and skip the keys entirely
+docker compose up
+# Open http://localhost:5173
+```
+
+**With mock LLM (no API spend):**
+
+```bash
+MOCK_LLM=1 docker compose --profile mock up
+```
+
+**Running tests:**
+
+```bash
+docker compose run --rm api npm test
+```
+
+Integration tests use testcontainers to spin up an ephemeral Postgres separate from the long-running `postgres` service — tests never touch dev data.
+
+**Reset to clean state:**
+
+```bash
+docker compose down -v   # also wipes pg-data and audio-data
+docker compose up
+```
+
+**Convenience scripts** (root `package.json`):
+
+- `npm run dev` → `docker compose up`
+- `npm run dev:mock` → `MOCK_LLM=1 docker compose --profile mock up`
+- `npm run dev:reset` → `docker compose down -v && docker compose up`
+- `npm run prod:local` → see §4.5
+
+### 4.5 Production parity check
+
+A second compose file, `docker-compose.prod-local.yml`, runs the **production** Dockerfiles against local Postgres. No hot reload, no source mounts — the actual production image as it would ship to Fly. Used to smoke-test the prod image before `fly deploy`.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod-local.yml up --build
+```
+
+This catches issues that hot-reload dev mode hides:
+
+- Missing files in the prod `Dockerfile` `COPY` list.
+- Build-time-only deps accidentally needed at runtime.
+- Static asset paths that work via Vite dev server but break when served by Express.
+- Environment variable handling in the production entrypoint.
+
+The rule: if `npm run prod:local` doesn't work, `fly deploy` won't either. Run it before every deploy in Phase 1.
+
+### 4.6 Local-to-production parity table
+
+| Concern | Local (`docker compose up`) | Production (Fly.io) |
+|---|---|---|
+| Backend container | `api` service, `Dockerfile.dev` (hot reload) | `api` machine, `Dockerfile` (prod build) |
+| Frontend | Vite dev server, separate container, HMR | Static assets baked into the api prod image |
+| Database | `postgres:16-alpine` in compose, named volume | Fly Managed Postgres 16, automatic snapshots |
+| Audio storage | Named docker volume at `/data/audio` | Fly persistent volume at `/data` |
+| API keys | `.env` file (gitignored) loaded via `env_file` | `fly secrets set` injects as env vars |
+| `MOCK_LLM` flag | Available via `--profile mock` | Available — useful for staging without spend |
+| TLS | None (`http://localhost:5173`) | Let's Encrypt, auto-provisioned |
+| Postgres backup | None (`docker compose down -v` to reset) | Daily snapshots managed by Fly |
+
+The parity is deliberate: anything that runs cleanly under `npm run prod:local` will run cleanly on Fly.
+
+## 5. Session Model
 
 The app is "anonymous but persistent." On first visit, the backend issues a session token (22-char base62, ≥130 bits of entropy from CSPRNG). The token is stored in browser localStorage and sent as `X-Session-Token` on every API call. The URL form `?s=<token>` re-attaches a session — this is how a user shares progress across devices or with a friend.
 
@@ -80,7 +230,7 @@ The app is "anonymous but persistent." On first visit, the backend issues a sess
 - The hourly GC deletes sessions inactive for more than `SESSION_TTL_DAYS` (default 7), cascading to all dependent rows and audio files.
 - A user returning after expiry lands on an empty session and sees a banner: "This session expired; starting fresh."
 
-## 5. Data Model (Postgres)
+## 6. Data Model (Postgres)
 
 ```sql
 sessions
@@ -169,7 +319,7 @@ audit_log
 
 Indexes: `sessions(last_active_at)` for GC; `messages(interview_id, created_at)`; `usage_log(session_id, created_at)`.
 
-## 6. Retention & Garbage Collection
+## 7. Retention & Garbage Collection
 
 A single in-process hourly job (`node-cron`) handles all TTL work:
 
@@ -181,7 +331,7 @@ UX implications:
 - A returning user whose audio expired but session is still active sees transcripts with a small "audio expired" note next to each turn. Replay works for text.
 - A returning user whose session expired lands on a fresh session, sees a one-line banner.
 
-## 7. The Four User Modes
+## 8. The Four User Modes
 
 ### 7.1 Resume ↔ JD Gap Analyzer
 
@@ -242,7 +392,7 @@ Same as 7.2, plus an audio loop per turn:
 - **Restart with fresh context** button in every mode.
 - **Export** in every mode (markdown).
 
-## 8. Backend API Surface
+## 9. Backend API Surface
 
 All routes under `/api/v1`. Session token via `X-Session-Token` header. Streaming endpoints use SSE.
 
@@ -307,7 +457,7 @@ In order:
 5. `requestLogger` — structured JSON (pino) with redaction of resume text and message bodies.
 6. `errorHandler` — terminal; maps errors to `{ error: { code, message, request_id } }`.
 
-## 9. Prompt Architecture
+## 10. Prompt Architecture
 
 All prompts live in `apps/api/src/prompts/` as TypeScript modules exporting `{ version, render(input): string }`. **No inline prompts in route handlers.**
 
@@ -329,7 +479,7 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 - Resume JSON, plan, and current-round metadata re-injected every turn.
 - Anthropic prompt caching (`cache_control: ephemeral`) applied to system prompt + resume JSON + plan, so the cached prefix is shared across all turns of an interview.
 
-## 10. LLM/STT/TTS Client Wrappers
+## 11. LLM/STT/TTS Client Wrappers
 
 `apps/api/src/clients/claude.ts`:
 - Wraps `@anthropic-ai/sdk`.
@@ -340,7 +490,7 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 
 `apps/api/src/clients/openai.ts`: same shape for Whisper and TTS.
 
-## 11. Error Handling — User-Visible Contract
+## 12. Error Handling — User-Visible Contract
 
 | Failure | User sees | Server does |
 |---|---|---|
@@ -353,7 +503,7 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 | Resume parse fails | "Couldn't parse that resume; paste as text instead?" | offers raw-text fallback |
 | Rate limit hit | "You've hit your limit; try again in N min" | 429 with `Retry-After` |
 
-## 12. Testing Strategy
+## 13. Testing Strategy
 
 **Unit (Vitest):** prompt template renderers (snapshot tests), pure helpers (conversation summarizer, cost calculator, rate limiter, resume parser post-processing), React component logic (RTL handling, hint slider, cost meter).
 
@@ -366,7 +516,7 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 
 **LLM evals (`apps/api/evals/`):** scripted harness runs the interviewer prompt against ~20 transcripts using Claude as judge. Scores behavioral consistency (one-question-at-a-time, language adherence, hint compliance). Results checked into the repo as JSON. On-demand, not on every commit.
 
-## 13. Observability
+## 14. Observability
 
 - **Logs (pino):** `request_id`, `session_id`, `route`, `prompt_version`, `latency_ms`, token counts, cache hit counts. Resume text and message bodies redacted.
 - **Metrics (`prom-client` at `/metrics`):** request counts, p50/p95/p99 per route, LLM error rates, GC throughput, `/data/audio` size.
@@ -374,12 +524,12 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 - **`audit_log` table** for refusals, rate-limit hits, parse failures.
 - **No external APM in Phase 1.** Platform's built-in log viewer is enough.
 
-## 14. Deployment
+## 15. Deployment
 
 - **Target:** Fly.io, Frankfurt region (`fra`) — closest to Israel (~70 ms RTT to Tel Aviv).
 - **Backend instance:** `shared-cpu-1x`, 1 vCPU, 1 GB RAM, single machine in Phase 1. Scales horizontally later by lifting audio to S3 first.
 - **Postgres:** Fly Managed Postgres, "Development" cluster (1 GB RAM, 10 GB disk, daily snapshots). Connection string injected via `DATABASE_URL` secret.
-- **Volume:** Fly 10 GB persistent volume mounted at `/data`. Attached to the single machine. (When scaling out, audio moves to S3-compatible storage; see Section 17.)
+- **Volume:** Fly 10 GB persistent volume mounted at `/data`. Attached to the single machine. (When scaling out, audio moves to S3-compatible storage; see Section 19.)
 - **TLS:** Let's Encrypt certificates auto-provisioned by Fly when the custom domain is added. Automatic renewal.
 - **Domain:** registered separately (Cloudflare Registrar recommended, ~$10/yr for a `.com`). DNS managed via Cloudflare or the registrar; an `A`/`AAAA` record points to the Fly app's anycast IP.
 - **Frontend:** built via `vite build`, served as static assets by the Express backend from `apps/web/dist`. Single deploy, single domain — no CORS hop for production traffic, no separate CDN needed in Phase 1.
@@ -413,7 +563,7 @@ All managed via the platform's secret store. A `.env.example` lists every requir
 - **On merge to `main`:** auto-deploy to Fly/Render.
 - **Nightly:** E2E suite against the preview deployment.
 
-## 15. Security Posture (Phase 1)
+## 16. Security Posture (Phase 1)
 
 ### 15.1 General
 
@@ -489,7 +639,7 @@ dist/
 
 When BYOK arrives: per-user keys stored in a new `user_credentials` table, encrypted with AES-256-GCM using a server-held master key (held in Fly secrets, never in DB). Master key rotation strategy: dual-key for the rotation window, re-encrypt rows on access. Users can paste/replace/delete their key from the UI; deletion is immediate and audited.
 
-## 16. Cost & Infrastructure Estimates
+## 17. Cost & Infrastructure Estimates
 
 All figures are **list-price estimates as of the spec date** (2026-05-28). They assume the model selections, prompt caching, and rate limits defined elsewhere in this spec. They will drift over time and should be revalidated when costs become operationally relevant.
 
@@ -545,7 +695,7 @@ All figures are **list-price estimates as of the spec date** (2026-05-28). They 
 
 ### 16.6 Spending guardrails (mandatory on day one)
 
-These are in addition to in-app rate limits (Section 8.2):
+These are in addition to in-app rate limits (Section 9.2):
 
 - Anthropic monthly cap: **$200**, alert at $100.
 - OpenAI monthly cap: **$100**, alert at $50.
@@ -553,16 +703,16 @@ These are in addition to in-app rate limits (Section 8.2):
 
 Combined, the worst-case monthly spend even with a leaked session token is capped at $300 ($200 + $100 vendor limits), not unbounded.
 
-## 17. Repo Conventions
+## 18. Repo Conventions
 
 - **TypeScript strict mode** everywhere. `any` requires a `// reason: ...` comment.
 - **Shared types in `packages/shared`.** Both apps import from there. Runtime validation at API boundary via Zod (request bodies server-side, response shapes client-side).
-- **Prompts in their own files** (Section 9), with version strings.
+- **Prompts in their own files** (Section 10), with version strings.
 - **Thin route handlers, fat services.** `routes/` → `services/` → `repositories/`. Each file focuses on one concern.
 - **Lint + format via eslint + prettier.** Single shared config at repo root.
 - **Git from day one.** `git init` is part of the first scaffold step. `.gitignore` covers `node_modules`, `.env*` (except `.env.example`), `dist/`, `/data/`, and editor folders.
 
-## 18. Phase 2+ Evolution Path
+## 19. Phase 2+ Evolution Path
 
 Designed so the following are additive, not rewrites:
 
@@ -574,7 +724,7 @@ Designed so the following are additive, not rewrites:
 - **Mobile client:** REST/SSE API is the contract; React Native client reuses `packages/shared` types.
 - **Improvement loop:** `usage_log` + `messages` already structured for offline analysis. Add a thumbs-up/down per assistant turn.
 
-## 19. Out of Scope (Phase 1, Explicit)
+## 20. Out of Scope (Phase 1, Explicit)
 
 - Real accounts, OAuth, magic links.
 - Payments / billing.
@@ -586,7 +736,7 @@ Designed so the following are additive, not rewrites:
 - Long-term retention beyond 7 days.
 - Live-interview assistance (real interviews with employers). The product is explicitly a coaching tool; this is a product-policy boundary, not a technical one.
 
-## 20. Open Items Tracked for Phase 1 Implementation
+## 21. Open Items Tracked for Phase 1 Implementation
 
 - Exact Claude model selection (Sonnet 4.6 vs Opus 4.7 per prompt) — to be tuned during build, based on latency vs quality trade-offs per mode. Voice mode is most latency-sensitive.
 - TTS voice selection (`nova` vs `alloy` vs others) for Hebrew quality — A/B during build.
