@@ -26,14 +26,15 @@ A Hebrew-first web app that helps software engineers prepare for technical inter
 | TTS | OpenAI TTS (`tts-1`, voice configurable) |
 | Backend | Node.js + Express + TypeScript |
 | Frontend | Vite + React + TypeScript |
-| DB | Postgres (managed: Neon or Fly Postgres) |
-| Audio storage (Phase 1) | Local disk under `/data/audio` |
+| DB | Managed Postgres on Fly.io |
+| Audio storage (Phase 1) | Local disk under `/data/audio` on Fly volume |
 | Data TTL | 7 days for everything (audio + text); session activity bumps it |
 | Audio cap | 5 GB global, oldest-first eviction |
 | Rate limit | 30 LLM calls/hr, 5 audio uploads/min, per session token |
 | Cost meter | Visible in UI, server-computed |
 | Mic UX | Toggle (click to start, click to stop). Spacebar shortcut. |
-| Deploy target | Fly.io or Render |
+| Deploy target | **Fly.io** (Frankfurt region) |
+| Key model | Operator-provided keys (Tzahi pays); no BYOK in Phase 1 |
 | Repo | Monorepo, npm workspaces |
 
 ## 3. High-Level Architecture
@@ -375,11 +376,13 @@ Each prompt file exports a `version` string. Logs record `prompt_version` per ca
 
 ## 14. Deployment
 
-- **Target:** Fly.io or Render. Both support persistent volumes (needed for `/data/audio`), managed Postgres, and TLS. Vercel is excluded — persistent disk and long SSE streams don't fit.
-- **Single backend instance:** 1 vCPU, 1 GB RAM.
-- **Postgres:** managed (Neon free tier or Fly Postgres).
-- **Volume:** 10 GB mounted at `/data`.
-- **Frontend:** built via `vite build`, served as static assets by the Express backend from `apps/web/dist`.
+- **Target:** Fly.io, Frankfurt region (`fra`) — closest to Israel (~70 ms RTT to Tel Aviv).
+- **Backend instance:** `shared-cpu-1x`, 1 vCPU, 1 GB RAM, single machine in Phase 1. Scales horizontally later by lifting audio to S3 first.
+- **Postgres:** Fly Managed Postgres, "Development" cluster (1 GB RAM, 10 GB disk, daily snapshots). Connection string injected via `DATABASE_URL` secret.
+- **Volume:** Fly 10 GB persistent volume mounted at `/data`. Attached to the single machine. (When scaling out, audio moves to S3-compatible storage; see Section 17.)
+- **TLS:** Let's Encrypt certificates auto-provisioned by Fly when the custom domain is added. Automatic renewal.
+- **Domain:** registered separately (Cloudflare Registrar recommended, ~$10/yr for a `.com`). DNS managed via Cloudflare or the registrar; an `A`/`AAAA` record points to the Fly app's anycast IP.
+- **Frontend:** built via `vite build`, served as static assets by the Express backend from `apps/web/dist`. Single deploy, single domain — no CORS hop for production traffic, no separate CDN needed in Phase 1.
 
 ### 14.1 Secrets
 
@@ -412,15 +415,145 @@ All managed via the platform's secret store. A `.env.example` lists every requir
 
 ## 15. Security Posture (Phase 1)
 
+### 15.1 General
+
 - Session tokens: 22-char base62, CSPRNG, ≥130 bits entropy. Bearer credentials.
-- HTTPS-only in production.
-- Audio file serving (`GET /audio/:id.mp3`) verifies the requesting session owns the parent message.
+- HTTPS-only in production (HTTP → HTTPS redirect at the Fly proxy).
+- Audio file serving (`GET /audio/:id.mp3`) verifies the requesting session owns the parent message — direct guessing is infeasible.
 - Resume binaries processed in-memory and discarded; only extracted text + parsed JSON hit the DB.
 - CORS allowlist: production origin + `localhost:5173`. No wildcards.
 - Input size caps: resume ≤5 MB, JD ≤50 KB, audio chunk ≤25 MB. Enforced before LLM calls.
-- API keys never leave the server.
 
-## 16. Repo Conventions
+### 15.2 Secrets & API Key Management
+
+**Key model:** Operator (Tzahi) provides Anthropic and OpenAI API keys. All user traffic runs on these keys. Users have zero key setup. BYOK is explicitly deferred to Phase 2.
+
+**Where keys live:**
+
+| Location | What's there | Who can read |
+|---|---|---|
+| Local laptop `apps/api/.env` | Real keys for dev | Local user; filesystem perms only. Not in git. |
+| Git repo | `.env.example` only — placeholder strings | Anyone with repo access. No real secrets. |
+| Fly secrets store | Real keys, encrypted at rest by Fly | Operator via `fly` CLI auth; running container as env vars |
+| Express process memory | Real keys via `process.env` | The process and anyone with container shell access |
+| Browser / frontend | **Never.** | — |
+| Postgres | **Never** in Phase 1. (Phase 2 BYOK: per-user keys encrypted with a server-held master key.) | — |
+
+**How keys are loaded:**
+
+- Dev: `dotenv` loads `apps/api/.env` into `process.env` at startup.
+- Prod: keys set once via `fly secrets set ANTHROPIC_API_KEY=…`. Fly injects them as env vars; no `.env` file exists on the production machine.
+- CI: tests run with `MOCK_LLM=1`; no real keys needed.
+
+**Required `.gitignore` entries (committed from day one):**
+
+```
+.env
+.env.*
+!.env.example
+/data/
+node_modules/
+dist/
+```
+
+**Hardening:**
+
+- **Pre-commit hook** (`lefthook` or `husky` + `lint-staged`) runs `gitleaks protect --staged` to block commits containing strings that look like API keys. Catches accidental paste-into-code.
+- **Pino redaction:** the logger redacts `*.apiKey`, `*.token`, `authorization` headers, `process.env.*_KEY`, and resume/message bodies. No key value ever lands in logs.
+- **No env echo in any script.** CI scripts never `echo $SECRET`; tests never `console.log(process.env)`.
+- **Response sanitation:** the error handler never includes `process.env`, `req.headers`, or unredacted request bodies in error responses.
+
+**Threat model — realistic ways a key leaks, and the mitigation in place:**
+
+| Threat | Mitigation |
+|---|---|
+| Accidentally committing `.env` | `.gitignore` + `gitleaks` pre-commit hook |
+| Logging the key | Pino redaction list + lint rule banning `console.log(process.env)` |
+| Returning the key in an API response | Error handler whitelist; integration test verifies no key-shaped string ever appears in any response body |
+| Running container compromised | 2FA on Fly account; rotate keys quarterly |
+| Vendor account compromised | 2FA on Anthropic, OpenAI; hard spending caps in vendor dashboards bound the blast radius |
+| Key leaked in any way | Rotate immediately at the vendor dashboard; redeploy via `fly secrets set`; no code change needed |
+
+**Vendor-level spending caps (set on day one, regardless of estimated usage):**
+
+- Anthropic: $200/month hard cap, email alert at $100.
+- OpenAI: $100/month hard cap, email alert at $50.
+- These bound worst-case damage from a leaked key to the cap, not "unlimited."
+
+**Rotation policy:**
+
+- Routine rotation every 90 days (calendar reminder).
+- Immediate rotation on any of: laptop compromise, repo accidentally made public, suspicious activity on vendor dashboard, departure of anyone with prod access.
+
+### 15.3 Phase 2 BYOK Considerations (Not in Phase 1, documented for evolution)
+
+When BYOK arrives: per-user keys stored in a new `user_credentials` table, encrypted with AES-256-GCM using a server-held master key (held in Fly secrets, never in DB). Master key rotation strategy: dual-key for the rotation window, re-encrypt rows on access. Users can paste/replace/delete their key from the UI; deletion is immediate and audited.
+
+## 16. Cost & Infrastructure Estimates
+
+All figures are **list-price estimates as of the spec date** (2026-05-28). They assume the model selections, prompt caching, and rate limits defined elsewhere in this spec. They will drift over time and should be revalidated when costs become operationally relevant.
+
+### 16.1 Vendor unit rates (snapshot)
+
+| Service | Rate |
+|---|---|
+| Claude Sonnet 4.6 input / output / cached read | $3.00 / $15.00 / $0.30 per 1M tokens |
+| Claude Opus 4.7 input / output | $15.00 / $75.00 per 1M tokens |
+| OpenAI Whisper STT | $0.006 per minute of audio |
+| OpenAI `tts-1` | $15.00 per 1M characters |
+
+### 16.2 Per-operation costs
+
+- Resume parse (Sonnet): **~$0.01** per resume.
+- Gap analysis (Opus): **~$0.27** per role analyzed.
+- Text interview turn (Sonnet, prompt caching active): first turn ~$0.02, subsequent turns **~$0.008** each.
+- Voice interview turn (Sonnet + Whisper + TTS): **~$0.010** per turn.
+- End-of-interview feedback (Opus): **~$0.45** per completed interview. *(Tuning knob: switching to Sonnet drops this to ~$0.09 with some loss of feedback depth.)*
+- Q&A tutor turn (Sonnet): **~$0.022**.
+
+### 16.3 Monthly cost — 6 active users (canonical Phase 1 estimate)
+
+**Usage assumptions:** 6 users, each doing ~3 mock interviews/week, ~60 turns/interview, half voice/half text; 5 gap analyses/user/month; 30 Q&A questions/user/month.
+
+| Line item | Detail | $/month |
+|---|---|---:|
+| Fly compute | `shared-cpu-1x`, 1 vCPU / 1 GB | $5 |
+| Fly volume | 10 GB at `/data` | $1.50 |
+| Fly Postgres | Development cluster | $15 |
+| Domain | `.com` amortized | $1 |
+| **Infra subtotal** | | **$22** |
+| Claude Sonnet — interview turns | ~7,200 turns × $0.008 | $58 |
+| Claude Opus — gap + feedback | 30 × $0.27 + 72 × $0.45 | $41 |
+| Claude Sonnet — Q&A | 180 × $0.022 | $4 |
+| Whisper STT | ~600 min × $0.006 | $4 |
+| OpenAI TTS | ~3,600 voice turns × ~500 chars avg | $27 |
+| Resume parsing | ~30 resumes × $0.01 | $0.30 |
+| **AI subtotal** | | **$134** |
+| **MONTHLY TOTAL** | | **~$156** |
+
+### 16.4 Sensitivity ranges
+
+- **Light usage (6 users, mostly casual):** $80–120/mo
+- **Steady usage (assumptions above):** $140–165/mo
+- **Heavy usage (everyone practicing daily before real interviews):** $250–350/mo
+
+### 16.5 Cost-driver observations
+
+- **AI APIs are ~86% of every dollar.** Hosting choice barely moves the needle at Phase 1 scale.
+- **Largest controllable cost is end-of-interview feedback** (~$41/mo at 6 users). The Sonnet-vs-Opus tradeoff for this prompt is the highest-leverage tuning knob.
+- **TTS scales with output length, not turn count.** The `interviewer` prompt is tuned to keep interviewer turns short and conversational; lecturing would balloon TTS cost.
+
+### 16.6 Spending guardrails (mandatory on day one)
+
+These are in addition to in-app rate limits (Section 8.2):
+
+- Anthropic monthly cap: **$200**, alert at $100.
+- OpenAI monthly cap: **$100**, alert at $50.
+- App-level rate limit per session token (already in spec): 30 LLM calls/hr + 5 audio uploads/min, bounds worst-case session burn at ~$5/hr.
+
+Combined, the worst-case monthly spend even with a leaked session token is capped at $300 ($200 + $100 vendor limits), not unbounded.
+
+## 17. Repo Conventions
 
 - **TypeScript strict mode** everywhere. `any` requires a `// reason: ...` comment.
 - **Shared types in `packages/shared`.** Both apps import from there. Runtime validation at API boundary via Zod (request bodies server-side, response shapes client-side).
@@ -429,7 +562,7 @@ All managed via the platform's secret store. A `.env.example` lists every requir
 - **Lint + format via eslint + prettier.** Single shared config at repo root.
 - **Git from day one.** `git init` is part of the first scaffold step. `.gitignore` covers `node_modules`, `.env*` (except `.env.example`), `dist/`, `/data/`, and editor folders.
 
-## 17. Phase 2+ Evolution Path
+## 18. Phase 2+ Evolution Path
 
 Designed so the following are additive, not rewrites:
 
@@ -441,7 +574,7 @@ Designed so the following are additive, not rewrites:
 - **Mobile client:** REST/SSE API is the contract; React Native client reuses `packages/shared` types.
 - **Improvement loop:** `usage_log` + `messages` already structured for offline analysis. Add a thumbs-up/down per assistant turn.
 
-## 18. Out of Scope (Phase 1, Explicit)
+## 19. Out of Scope (Phase 1, Explicit)
 
 - Real accounts, OAuth, magic links.
 - Payments / billing.
@@ -453,7 +586,7 @@ Designed so the following are additive, not rewrites:
 - Long-term retention beyond 7 days.
 - Live-interview assistance (real interviews with employers). The product is explicitly a coaching tool; this is a product-policy boundary, not a technical one.
 
-## 19. Open Items Tracked for Phase 1 Implementation
+## 20. Open Items Tracked for Phase 1 Implementation
 
 - Exact Claude model selection (Sonnet 4.6 vs Opus 4.7 per prompt) — to be tuned during build, based on latency vs quality trade-offs per mode. Voice mode is most latency-sensitive.
 - TTS voice selection (`nova` vs `alloy` vs others) for Hebrew quality — A/B during build.
